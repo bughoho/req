@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"mime"
 	"net"
 	"net/http"
@@ -2124,6 +2125,9 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *pers
 					return nil, err
 				}
 			} else {
+				if rand.Intn(100) == 0 {
+					fmt.Printf("addTLS_1:proxyURL: %v, targetAddr: %s\n", cm.proxyURL, cm.targetAddr)
+				}
 				if err = pconn.addTLS(ctx, firstTLSHost, trace, cm.proxyURL != nil); err != nil {
 					return nil, wrapErr(err)
 				}
@@ -2252,6 +2256,9 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *pers
 				return nil, err
 			}
 		} else {
+			if rand.Intn(100) == 0 {
+				fmt.Printf("addTLS_2:proxyURL: %v, targetAddr: %s\n", cm.proxyURL, cm.targetAddr)
+			}
 			if err := pconn.addTLS(ctx, cm.tlsHost(), trace, false); err != nil {
 				return nil, err
 			}
