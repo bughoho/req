@@ -1202,53 +1202,6 @@ type uTLSConn struct {
 	*utls.UConn
 }
 
-// tlsClientSessionCacheWrapper wraps tls.ClientSessionCache to implement utls.ClientSessionCache
-type tlsClientSessionCacheWrapper struct {
-	cache tls.ClientSessionCache
-	// Store mapping between session keys and states since we can't directly convert between types
-	sessions map[string]*utls.ClientSessionState
-}
-
-func newTLSClientSessionCacheWrapper(cache tls.ClientSessionCache) *tlsClientSessionCacheWrapper {
-	return &tlsClientSessionCacheWrapper{
-		cache:    cache,
-		sessions: make(map[string]*utls.ClientSessionState),
-	}
-}
-
-func (w *tlsClientSessionCacheWrapper) Get(sessionKey string) (*utls.ClientSessionState, bool) {
-	if w.cache == nil {
-		return nil, false
-	}
-
-	// First check if we have it in our utls sessions map
-	if state, ok := w.sessions[sessionKey]; ok {
-		return state, true
-	}
-
-	// Check if the underlying tls cache has it
-	_, ok := w.cache.Get(sessionKey)
-	if !ok {
-		return nil, false
-	}
-
-	// Return nil since we can't convert between incompatible types
-	// The session will need to be established fresh
-	return nil, false
-}
-
-func (w *tlsClientSessionCacheWrapper) Put(sessionKey string, cs *utls.ClientSessionState) {
-	if w.cache == nil || cs == nil {
-		return
-	}
-
-	// Store in our utls sessions map
-	w.sessions[sessionKey] = cs
-
-	// We can't convert utls.ClientSessionState to tls.ClientSessionState
-	// so we just store it in our wrapper's map
-}
-
 func (conn *uTLSConn) ConnectionState() tls.ConnectionState {
 	cs := conn.Conn.ConnectionState()
 	return tls.ConnectionState{
@@ -1280,12 +1233,6 @@ func (c *Client) SetTLSFingerprint(clientHelloID utls.ClientHelloID) *Client {
 		hostname := addr[:colonPos]
 		tlsConfig := c.GetTLSClientConfig()
 
-		// Wrap the tls.ClientSessionCache to make it compatible with utls.ClientSessionCache
-		var clientSessionCache utls.ClientSessionCache
-		if tlsConfig.ClientSessionCache != nil {
-			clientSessionCache = newTLSClientSessionCacheWrapper(tlsConfig.ClientSessionCache)
-		}
-
 		utlsConfig := &utls.Config{
 			ServerName:                  hostname,
 			Rand:                        tlsConfig.Rand,
@@ -1301,7 +1248,6 @@ func (c *Client) SetTLSFingerprint(clientHelloID utls.ClientHelloID) *Client {
 			DynamicRecordSizingDisabled: tlsConfig.DynamicRecordSizingDisabled,
 			KeyLogWriter:                tlsConfig.KeyLogWriter,
 			VerifyPeerCertificate:       tlsConfig.VerifyPeerCertificate,
-			ClientSessionCache:          clientSessionCache,
 		}
 		uconn := &uTLSConn{utls.UClient(plainConn, utlsConfig, clientHelloID)}
 		err = uconn.HandshakeContext(ctx)
