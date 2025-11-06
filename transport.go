@@ -3668,6 +3668,9 @@ func (es *bodyEOFSignal) condfn(err error) error {
 	return err
 }
 
+// gzipReaderPool is a pool of gzip.Reader to reduce GC pressure
+var gzipReaderPool sync.Pool
+
 // gzipReader wraps a response body so it can lazily
 // call gzip.NewReader on the first call to Read
 type gzipReader struct {
@@ -3680,7 +3683,13 @@ type gzipReader struct {
 func (gz *gzipReader) Read(p []byte) (n int, err error) {
 	if gz.zr == nil {
 		if gz.zerr == nil {
-			gz.zr, gz.zerr = gzip.NewReader(gz.body)
+			// Try to get a gzip.Reader from the pool
+			if v := gzipReaderPool.Get(); v != nil {
+				gz.zr = v.(*gzip.Reader)
+				gz.zerr = gz.zr.Reset(gz.body)
+			} else {
+				gz.zr, gz.zerr = gzip.NewReader(gz.body)
+			}
 		}
 		if gz.zerr != nil {
 			return 0, gz.zerr
@@ -3700,6 +3709,12 @@ func (gz *gzipReader) Read(p []byte) (n int, err error) {
 }
 
 func (gz *gzipReader) Close() error {
+	// Return the gzip.Reader to the pool for reuse
+	if gz.zr != nil {
+		gz.zr.Close()
+		gzipReaderPool.Put(gz.zr)
+		gz.zr = nil
+	}
 	return gz.body.Close()
 }
 
