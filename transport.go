@@ -48,6 +48,7 @@ import (
 	"github.com/imroc/req/v3/internal/util"
 	"github.com/imroc/req/v3/pkg/altsvc"
 	reqtls "github.com/imroc/req/v3/pkg/tls"
+	"github.com/klauspost/pgzip"
 	htmlcharset "golang.org/x/net/html/charset"
 	"golang.org/x/text/encoding/ianaindex"
 
@@ -69,6 +70,20 @@ const (
 // defaultMaxIdleConnsPerHost is the default value of Transport's
 // MaxIdleConnsPerHost.
 const defaultMaxIdleConnsPerHost = 2
+
+// GzipType represents the type of gzip implementation to use
+type GzipType int
+
+const (
+	// UseStandardGzip uses the standard compress/gzip package
+	UseStandardGzip GzipType = iota
+	// UsePgzip uses the klauspost/pgzip package for parallel gzip
+	UsePgzip
+)
+
+// DefaultGzipType is the default gzip implementation type.
+// Can be set to UseStandardGzip or UsePgzip.
+var DefaultGzipType = UseStandardGzip
 
 // Transport is an implementation of http.RoundTripper that supports HTTP,
 // HTTPS, and HTTP proxies (for either HTTP or HTTPS with CONNECT).
@@ -672,6 +687,8 @@ func (t *Transport) handlePendingAltSvc(u *url.URL, pas *pendingAltSvc) {
 func (t *Transport) wrapResponseBody(res *http.Response, wrap wrapResponseBodyFunc) {
 	switch b := res.Body.(type) {
 	case *gzipReader:
+		b.body.body = wrap(b.body.body)
+	case *pgzipReader:
 		b.body.body = wrap(b.body.body)
 	case compress.CompressReader:
 		b.SetUnderlyingBody(wrap(b.GetUnderlyingBody()))
@@ -2786,7 +2803,12 @@ func (pc *persistConn) readLoop() {
 
 		resp.Body = body
 		if rc.addedGzip && ascii.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
-			resp.Body = &gzipReader{body: body}
+			// Use the selected gzip implementation based on DefaultGzipType
+			if DefaultGzipType == UsePgzip {
+				resp.Body = &pgzipReader{body: body}
+			} else {
+				resp.Body = &gzipReader{body: body}
+			}
 			resp.Header.Del("Content-Encoding")
 			resp.Header.Del("Content-Length")
 			resp.ContentLength = -1
@@ -3713,6 +3735,56 @@ func (gz *gzipReader) Close() error {
 	if gz.zr != nil {
 		gz.zr.Close()
 		gzipReaderPool.Put(gz.zr)
+		gz.zr = nil
+	}
+	return gz.body.Close()
+}
+
+// pgzipReaderPool is a pool of pgzip.Reader to reduce GC pressure
+var pgzipReaderPool sync.Pool
+
+// pgzipReader wraps a response body so it can lazily
+// call pgzip.NewReader on the first call to Read
+type pgzipReader struct {
+	_    incomparable
+	body *bodyEOFSignal // underlying HTTP/1 response body framing
+	zr   *pgzip.Reader  // lazily-initialized pgzip reader
+	zerr error          // any error from pgzip.NewReader; sticky
+}
+
+func (gz *pgzipReader) Read(p []byte) (n int, err error) {
+	if gz.zr == nil {
+		if gz.zerr == nil {
+			// Try to get a pgzip.Reader from the pool
+			if v := pgzipReaderPool.Get(); v != nil {
+				gz.zr = v.(*pgzip.Reader)
+				gz.zerr = gz.zr.Reset(gz.body)
+			} else {
+				gz.zr, gz.zerr = pgzip.NewReader(gz.body)
+			}
+		}
+		if gz.zerr != nil {
+			return 0, gz.zerr
+		}
+	}
+
+	gz.body.mu.Lock()
+	if gz.body.closed {
+		err = errReadOnClosedResBody
+	}
+	gz.body.mu.Unlock()
+
+	if err != nil {
+		return 0, err
+	}
+	return gz.zr.Read(p)
+}
+
+func (gz *pgzipReader) Close() error {
+	// Return the pgzip.Reader to the pool for reuse
+	if gz.zr != nil {
+		gz.zr.Close()
+		pgzipReaderPool.Put(gz.zr)
 		gz.zr = nil
 	}
 	return gz.body.Close()
