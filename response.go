@@ -8,6 +8,7 @@ import (
 
 	"github.com/imroc/req/v3/internal/header"
 	"github.com/imroc/req/v3/internal/util"
+	pool "github.com/libp2p/go-buffer-pool"
 )
 
 // Response is the http response.
@@ -19,11 +20,12 @@ type Response struct {
 	// ResponseMiddleware that doesn't need to be executed when err occurs.
 	Err error
 	// Request is the Response's related Request.
-	Request    *Request
-	body       []byte
-	receivedAt time.Time
-	error      any
-	result     any
+	Request        *Request
+	body           []byte
+	receivedAt     time.Time
+	error          any
+	result         any
+	fromBufferPool bool // tracks if body was allocated from buffer pool
 }
 
 // IsSuccess method returns true if no error occurs and HTTP status `code >= 200 and <= 299`
@@ -198,12 +200,22 @@ func (r *Response) Into(v any) error {
 
 // Set response body with byte array content
 func (r *Response) SetBody(body []byte) {
+	// Release old buffer if it was from pool
+	if r.fromBufferPool && r.body != nil {
+		pool.Put(r.body)
+	}
 	r.body = body
+	r.fromBufferPool = false // New body is not from pool
 }
 
 // Set response body with string content
 func (r *Response) SetBodyString(body string) {
+	// Release old buffer if it was from pool
+	if r.fromBufferPool && r.body != nil {
+		pool.Put(r.body)
+	}
 	r.body = []byte(body)
+	r.fromBufferPool = false // New body is not from pool
 }
 
 // Bytes return the response body as []bytes that have already been read, could be
@@ -230,6 +242,55 @@ func (r *Response) ToString() (string, error) {
 	return string(b), err
 }
 
+// ReadAll reads all data from the response body.
+// It handles both buffer pool and standard io.ReadAll approaches.
+// Returns the body bytes, whether the buffer is from pool, and any error.
+func (r *Response) ReadAll() (body []byte, fromPool bool, err error) {
+	if r.Request.client.EnableBufferPool {
+		// Use buffer pool to allocate memory
+		// First, try to get content length
+		contentLength := r.ContentLength
+		if contentLength > 0 {
+			body = pool.Get(int(contentLength))
+		} else {
+			// Default initial size if content length is unknown
+			body = pool.Get(512)
+		}
+
+		var n int
+		n, err = io.ReadFull(r.Body, body)
+		if err == io.ErrUnexpectedEOF || err == io.EOF {
+			// Body is smaller than allocated buffer
+			body = body[:n]
+			err = nil
+		} else if err == nil && n == len(body) {
+			// Buffer might be too small, need to read more
+			var extra []byte
+			extra, err = io.ReadAll(r.Body)
+			if err == nil && len(extra) > 0 {
+				// Need to allocate larger buffer
+				newBody := pool.Get(len(body) + len(extra))
+				copy(newBody, body)
+				copy(newBody[len(body):], extra)
+				pool.Put(body) // Return old buffer
+				body = newBody
+			}
+		}
+
+		if err == nil {
+			fromPool = true
+		} else {
+			// On error, return buffer to pool
+			pool.Put(body)
+			body = nil
+		}
+	} else {
+		// Original behavior: use io.ReadAll
+		body, err = io.ReadAll(r.Body)
+	}
+	return
+}
+
 // ToBytes returns the response body as []byte, read body if not have been read.
 func (r *Response) ToBytes() (body []byte, err error) {
 	if r.Err != nil {
@@ -245,13 +306,32 @@ func (r *Response) ToBytes() (body []byte, err error) {
 		r.Body.Close()
 		if err != nil {
 			r.Err = err
+			// Release buffer on error if it was allocated from pool
+			if r.fromBufferPool && body != nil {
+				pool.Put(body)
+				body = nil
+				r.fromBufferPool = false
+			}
 		}
 		r.body = body
 	}()
-	body, err = io.ReadAll(r.Body)
+
+	body, r.fromBufferPool, err = r.ReadAll()
+
 	r.setReceivedAt()
 	if err == nil && r.Request.client.responseBodyTransformer != nil {
-		body, err = r.Request.client.responseBodyTransformer(body, r.Request, r)
+		if r.fromBufferPool {
+			// Copy the buffer pool slice before passing to transformer
+			bodyCopy := make([]byte, len(body))
+			copy(bodyCopy, body)
+			// Return original buffer to pool
+			pool.Put(body)
+			r.fromBufferPool = false
+			// Pass the copy to transformer
+			body, err = r.Request.client.responseBodyTransformer(bodyCopy, r.Request, r)
+		} else {
+			body, err = r.Request.client.responseBodyTransformer(body, r.Request, r)
+		}
 	}
 	return
 }
@@ -300,4 +380,19 @@ func (r *Response) HeaderToString() string {
 		return ""
 	}
 	return convertHeaderToString(r.Header)
+}
+
+// ReleaseBody returns the response body buffer to the buffer pool.
+// This should be called when you're done with the response body to free memory.
+// Only effective when EnableBufferPool is true and the body was allocated from the pool.
+// After calling this, r.body will be nil and subsequent calls to Bytes(), String(), etc.
+// will return empty results.
+func (r *Response) ReleaseBody() {
+	if r.fromBufferPool && r.body != nil {
+		pool.Put(r.body)
+		r.body = nil
+		r.fromBufferPool = false
+	} else {
+		r.body = nil
+	}
 }

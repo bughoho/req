@@ -738,7 +738,8 @@ func (r *Request) do() (resp *Response, err error) {
 		if r.trace != nil {
 			r.trace = &clientTrace{}
 		}
-		resp.body = nil
+		// Release buffer pool memory if allocated
+		resp.ReleaseBody()
 		resp.result = nil
 		resp.error = nil
 	}

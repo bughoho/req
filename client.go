@@ -50,6 +50,7 @@ type Client struct {
 	FormData              urlpkg.Values
 	DebugLog              bool
 	AllowGetMethodPayload bool
+	EnableBufferPool      bool
 	*Transport
 	digestAuth              *digestAuth
 	cookiejarFactory        func() *cookiejar.Jar
@@ -264,6 +265,14 @@ func (c *Client) SetBaseURL(u string) *Client {
 // be downloaded to.
 func (c *Client) SetOutputDirectory(dir string) *Client {
 	c.outputDirectory = dir
+	return c
+}
+
+// SetEnableBufferPool enable or disable buffer pool for response body.
+// When enabled, response body will be allocated from buffer pool to reduce GC pressure.
+// Default is false (disabled).
+func (c *Client) SetEnableBufferPool(enable bool) *Client {
+	c.EnableBufferPool = enable
 	return c
 }
 
@@ -1556,6 +1565,7 @@ func (c *Client) Clone() *Client {
 	cc.afterResponse = cloneSlice(c.afterResponse)
 	cc.dumpOptions = c.dumpOptions.Clone()
 	cc.retryOption = c.retryOption.Clone()
+	cc.EnableBufferPool = c.EnableBufferPool
 	return &cc
 }
 

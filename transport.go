@@ -3761,6 +3761,9 @@ func (gz *pgzipReader) Read(p []byte) (n int, err error) {
 				gz.zerr = gz.zr.Reset(gz.body)
 			} else {
 				gz.zr, gz.zerr = pgzip.NewReader(gz.body)
+				if gz.zr != nil {
+					gz.zr.Multistream(false)
+				}
 			}
 		}
 		if gz.zerr != nil {
