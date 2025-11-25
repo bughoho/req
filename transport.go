@@ -3731,7 +3731,6 @@ func (gz *gzipReader) Read(p []byte) (n int, err error) {
 }
 
 func (gz *gzipReader) Close() error {
-	// Return the gzip.Reader to the pool for reuse
 	if gz.zr != nil {
 		gz.zr.Close()
 		gzipReaderPool.Put(gz.zr)
@@ -3784,7 +3783,6 @@ func (gz *pgzipReader) Read(p []byte) (n int, err error) {
 }
 
 func (gz *pgzipReader) Close() error {
-	// Return the pgzip.Reader to the pool for reuse
 	if gz.zr != nil {
 		gz.zr.Close()
 		pgzipReaderPool.Put(gz.zr)
