@@ -343,10 +343,6 @@ func (r *Response) ReadAll() (body []byte, fromPool bool, err error) {
 			if len(body) == cap(body) {
 				// Buffer is full, need to grow
 				// Check if we've hit the absolute limit
-				if cap(body) >= maxNonPoolSize {
-					err = io.ErrShortBuffer
-					break
-				}
 				body, fromPool = growSliceFromPool(body, cap(body)+1, fromPool)
 				// Note: Once fromPool becomes false (after exceeding maxBufferSize),
 				// it stays false for the rest of the operation. This ensures we never
