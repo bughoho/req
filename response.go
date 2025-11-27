@@ -246,11 +246,7 @@ func (r *Response) ToString() (string, error) {
 // maxBufferSize is the maximum buffer size we'll allocate from the pool.
 // This prevents unbounded memory growth and pool pollution.
 // Set to 16MB which is a reasonable limit for most HTTP responses.
-const maxBufferSize = 16 * 1024 * 1024 // 16MB
-
-// maxNonPoolSize is the absolute maximum size for non-pool allocations.
-// Beyond this size, we stop growing and return an error to prevent OOM.
-const maxNonPoolSize = 64 * 1024 * 1024 // 64MB
+const maxBufferSize = 32 * 1024 * 1024 // 16MB
 
 // growSliceFromPool grows a slice to the next power-of-2 bucket size.
 // It allocates a new slice from the pool, copies data, and returns the old slice to the pool.
@@ -271,10 +267,6 @@ func growSliceFromPool(old []byte, minCap int, oldFromPool bool) ([]byte, bool) 
 
 	// Limit maximum size to prevent pool pollution
 	if newCap > maxBufferSize {
-		// Limit non-pool allocation to prevent unbounded growth
-		if newCap > maxNonPoolSize {
-			newCap = maxNonPoolSize
-		}
 		// Fall back to standard allocation for very large buffers
 		newSlice := make([]byte, len(old), newCap)
 		copy(newSlice, old)
