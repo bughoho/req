@@ -445,6 +445,13 @@ func (t *Transport) SetHTTP2ConnectionFlow(flow uint32) *Transport {
 	return t
 }
 
+// SetHTTP2InitialStreamID set the first request stream ID.
+// OkHttp uses 3 (reserves stream 1), Go default is 1.
+func (t *Transport) SetHTTP2InitialStreamID(id uint32) *Transport {
+	t.t2.InitialStreamID = id
+	return t
+}
+
 // SetHTTP2HeaderPriority set the header priority param.
 func (t *Transport) SetHTTP2HeaderPriority(priority http2.PriorityParam) *Transport {
 	t.t2.HeaderPriority = priority

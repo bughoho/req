@@ -141,12 +141,20 @@ type Transport struct {
 
 	Settings []http2.Setting
 
-	ConnectionFlow uint32
-	HeaderPriority http2.PriorityParam
-	PriorityFrames []http2.PriorityFrame
+	ConnectionFlow    uint32
+	HeaderPriority    http2.PriorityParam
+	PriorityFrames    []http2.PriorityFrame
+	InitialStreamID   uint32 // First request stream ID. 0 means default (1). OkHttp uses 3.
 
 	connPoolOnce  sync.Once
 	connPoolOrDef ClientConnPool // non-nil version of ConnPool
+}
+
+func (t *Transport) initialStreamID() uint32 {
+	if t.InitialStreamID != 0 {
+		return t.InitialStreamID
+	}
+	return 1
 }
 
 // newTimer creates a new time.Timer, or a synthetic timer in tests.
@@ -700,7 +708,7 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool) (*ClientConn, erro
 		t:                     t,
 		tconn:                 c,
 		readerDone:            make(chan struct{}),
-		nextStreamID:          1,
+		nextStreamID:          t.initialStreamID(),
 		maxFrameSize:          16 << 10,                    // spec default
 		initialWindowSize:     65535,                       // spec default
 		maxConcurrentStreams:  initialMaxConcurrentStreams, // "infinite", per spec. Use a smaller value until we have received server settings.
