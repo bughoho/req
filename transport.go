@@ -314,9 +314,9 @@ func (t *Transport) SetTLSHandshakeTimeout(timeout time.Duration) *Transport {
 }
 
 // SetSocksDialTimeout sets the SocksDialTimeout, which bounds the SOCKS5
-// handshake after the TCP connection to the proxy is established. Zero
-// means no timeout. See Options.SocksDialTimeout for why the request
-// context does not bound this handshake.
+// handshake after the TCP connection to the proxy is established.
+// Non-positive means no timeout. See Options.SocksDialTimeout for why the
+// request context does not bound this handshake.
 func (t *Transport) SetSocksDialTimeout(timeout time.Duration) *Transport {
 	t.SocksDialTimeout = timeout
 	return t

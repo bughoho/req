@@ -68,7 +68,7 @@ type Options struct {
 	// wait for a TLS handshake. Zero means no timeout.
 	TLSHandshakeTimeout time.Duration
 
-	// SocksDialTimeout, if non-zero, bounds the SOCKS5 handshake
+	// SocksDialTimeout, if positive, bounds the SOCKS5 handshake
 	// (method negotiation + CONNECT to the target) performed after the
 	// TCP connection to the proxy is established.
 	//
@@ -77,7 +77,7 @@ type Options struct {
 	// deadline: the request's own timeout does NOT bound this handshake.
 	// Without this, a proxy that accepts TCP but never replies wedges the
 	// dial goroutine forever. Mirrors the fixed guard the HTTPS CONNECT
-	// proxy path already has. Zero means no timeout.
+	// proxy path already has. Non-positive means no timeout.
 	SocksDialTimeout time.Duration
 
 	// DisableKeepAlives, if true, disables HTTP keep-alives and
