@@ -15,6 +15,9 @@ import (
 	"github.com/imroc/req/v3/internal/dump"
 	reqheader "github.com/imroc/req/v3/internal/header"
 	"github.com/quic-go/qpack"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3/qlog"
+	"github.com/quic-go/quic-go/qlogwriter"
 
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/http2/hpack"
@@ -38,10 +41,9 @@ func newRequestWriter() *requestWriter {
 	}
 }
 
-func (w *requestWriter) WriteRequestHeader(wr io.Writer, req *http.Request, gzip bool, dumps []*dump.Dumper) error {
-	// TODO: figure out how to add support for trailers
+func (w *requestWriter) WriteRequestHeader(wr io.Writer, req *http.Request, gzip bool, streamID quic.StreamID, qlogger qlogwriter.Recorder, dumps []*dump.Dumper) error {
 	buf := &bytes.Buffer{}
-	if err := w.writeHeaders(buf, req, gzip, dumps); err != nil {
+	if err := w.writeHeaders(buf, req, gzip, streamID, qlogger, dumps); err != nil {
 		return err
 	}
 	if _, err := wr.Write(buf.Bytes()); err != nil {
@@ -52,22 +54,37 @@ func (w *requestWriter) WriteRequestHeader(wr io.Writer, req *http.Request, gzip
 	return nil
 }
 
-func (w *requestWriter) writeHeaders(wr io.Writer, req *http.Request, gzip bool, dumps []*dump.Dumper) error {
+func (w *requestWriter) writeHeaders(wr io.Writer, req *http.Request, gzip bool, streamID quic.StreamID, qlogger qlogwriter.Recorder, dumps []*dump.Dumper) error {
 	w.mutex.Lock()
 	defer w.mutex.Unlock()
 	defer w.encoder.Close()
 	defer w.headerBuf.Reset()
 
-	if err := w.encodeHeaders(req, gzip, "", actualContentLength(req), dumps); err != nil {
+	var trailers string
+	if len(req.Trailer) > 0 {
+		keys := make([]string, 0, len(req.Trailer))
+		for k := range req.Trailer {
+			if httpguts.ValidTrailerHeader(k) {
+				keys = append(keys, k)
+			}
+		}
+		trailers = strings.Join(keys, ", ")
+	}
+
+	headerFields, err := w.encodeHeaders(req, gzip, trailers, actualContentLength(req), qlogger != nil, dumps)
+	if err != nil {
 		return err
 	}
 
 	b := make([]byte, 0, 128)
 	b = (&headersFrame{Length: uint64(w.headerBuf.Len())}).Append(b)
+	if qlogger != nil {
+		qlogCreatedHeadersFrame(qlogger, streamID, len(b)+w.headerBuf.Len(), w.headerBuf.Len(), headerFields)
+	}
 	if _, err := wr.Write(b); err != nil {
 		return err
 	}
-	_, err := wr.Write(w.headerBuf.Bytes())
+	_, err = wr.Write(w.headerBuf.Bytes())
 	return err
 }
 
@@ -79,21 +96,26 @@ func isExtendedConnectRequest(req *http.Request) bool {
 // Modified to support Extended CONNECT:
 // Contrary to what the godoc for the http.Request says,
 // we do respect the Proto field if the method is CONNECT.
-func (w *requestWriter) encodeHeaders(req *http.Request, addGzipHeader bool, trailers string, contentLength int64, dumps []*dump.Dumper) error {
+//
+// The returned header fields are only set if doQlog is true.
+func (w *requestWriter) encodeHeaders(req *http.Request, addGzipHeader bool, trailers string, contentLength int64, doQlog bool, dumps []*dump.Dumper) ([]qlog.HeaderField, error) {
 	host := req.Host
 	if host == "" {
 		host = req.URL.Host
 	}
 	host, err := httpguts.PunycodeHostPort(host)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !httpguts.ValidHostHeader(host) {
-		return errors.New("http3: invalid Host header")
+		return nil, errors.New("http3: invalid Host header")
 	}
 
 	// http.NewRequest sets this field to HTTP/1.1
 	isExtendedConnect := isExtendedConnectRequest(req)
+	if isExtendedConnect && !validExtendedConnectProtocol(req.Proto) {
+		return nil, fmt.Errorf("invalid request :protocol %q", req.Proto)
+	}
 
 	var path string
 	if req.Method != http.MethodConnect || isExtendedConnect {
@@ -103,9 +125,9 @@ func (w *requestWriter) encodeHeaders(req *http.Request, addGzipHeader bool, tra
 			path = strings.TrimPrefix(path, req.URL.Scheme+"://"+host)
 			if !validPseudoPath(path) {
 				if req.URL.Opaque != "" {
-					return fmt.Errorf("invalid request :path %q from URL.Opaque = %q", orig, req.URL.Opaque)
+					return nil, fmt.Errorf("invalid request :path %q from URL.Opaque = %q", orig, req.URL.Opaque)
 				} else {
-					return fmt.Errorf("invalid request :path %q", orig)
+					return nil, fmt.Errorf("invalid request :path %q", orig)
 				}
 			}
 		}
@@ -116,11 +138,11 @@ func (w *requestWriter) encodeHeaders(req *http.Request, addGzipHeader bool, tra
 	// continue to reuse the hpack encoder for future requests)
 	for k, vv := range req.Header {
 		if !httpguts.ValidHeaderFieldName(k) {
-			return fmt.Errorf("invalid HTTP header name %q", k)
+			return nil, fmt.Errorf("invalid HTTP header name %q", k)
 		}
 		for _, v := range vv {
 			if !httpguts.ValidHeaderFieldValue(v) {
-				return fmt.Errorf("invalid HTTP header value %q for header %q", v, k)
+				return nil, fmt.Errorf("invalid HTTP header value %q for header %q", v, k)
 			}
 		}
 	}
@@ -253,6 +275,12 @@ func (w *requestWriter) encodeHeaders(req *http.Request, addGzipHeader bool, tra
 	traceHeaders := traceHasWroteHeaderField(trace)
 
 	// Header list size is ok. Write the headers.
+	var headerFields []qlog.HeaderField
+	if doQlog {
+		headerFields = make([]qlog.HeaderField, 0, len(req.Header))
+	}
+
+	// Header list size is ok. Write the headers.
 	enumerateHeaders(func(name, value string) {
 		name = strings.ToLower(name)
 		for _, dump := range dumps {
@@ -262,13 +290,16 @@ func (w *requestWriter) encodeHeaders(req *http.Request, addGzipHeader bool, tra
 		if traceHeaders {
 			trace.WroteHeaderField(name, []string{value})
 		}
+		if doQlog {
+			headerFields = append(headerFields, qlog.HeaderField{Name: name, Value: value})
+		}
 	})
 
 	for _, dump := range dumps {
 		dump.DumpRequestHeader([]byte("\r\n"))
 	}
 
-	return nil
+	return headerFields, nil
 }
 
 // authorityAddr returns a given authority (a host/IP, or host:port / ip:port)

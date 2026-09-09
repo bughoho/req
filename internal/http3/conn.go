@@ -15,6 +15,8 @@ import (
 
 	"github.com/imroc/req/v3/internal/transport"
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3/qlog"
+	"github.com/quic-go/quic-go/qlogwriter"
 	"github.com/quic-go/quic-go/quicvarint"
 
 	"github.com/quic-go/qpack"
@@ -23,6 +25,9 @@ import (
 const maxQuarterStreamID = 1<<60 - 1
 
 var errGoAway = errors.New("connection in graceful shutdown")
+
+// invalidStreamID is a stream ID that is invalid. The first valid stream ID in QUIC is 0.
+const invalidStreamID = quic.StreamID(-1)
 
 // Conn is an HTTP/3 connection.
 // It has all methods from the quic.Conn expect for AcceptStream, AcceptUniStream,
@@ -33,8 +38,8 @@ type Conn struct {
 
 	ctx context.Context
 
-	perspective Perspective
-	logger      *slog.Logger
+	isServer bool
+	logger   *slog.Logger
 
 	enableDatagrams bool
 
@@ -50,30 +55,42 @@ type Conn struct {
 
 	idleTimeout time.Duration
 	idleTimer   *time.Timer
+
+	qlogger qlogwriter.Recorder
+
+	// Track received unidirectional streams (only one of each type allowed)
+	rcvdControlStr      atomic.Bool
+	rcvdQPACKEncoderStr atomic.Bool
+	rcvdQPACKDecoderStr atomic.Bool
 }
 
 func newConnection(
 	ctx context.Context,
 	quicConn *quic.Conn,
 	enableDatagrams bool,
-	perspective Perspective,
+	isServer bool,
 	logger *slog.Logger,
 	idleTimeout time.Duration,
 	options *transport.Options,
 ) *Conn {
+	var qlogger qlogwriter.Recorder
+	if qlogTrace := quicConn.QlogTrace(); qlogTrace != nil && qlogTrace.SupportsSchemas(qlog.EventSchema) {
+		qlogger = qlogTrace.AddProducer()
+	}
 	c := &Conn{
 		ctx:              ctx,
 		conn:             quicConn,
 		Options:          options,
-		perspective:      perspective,
+		isServer:         isServer,
 		logger:           logger,
 		idleTimeout:      idleTimeout,
 		enableDatagrams:  enableDatagrams,
-		decoder:          qpack.NewDecoder(func(hf qpack.HeaderField) {}),
+		decoder:          qpack.NewDecoder(),
 		receivedSettings: make(chan struct{}),
 		streams:          make(map[quic.StreamID]*stateTrackingStream),
 		maxStreamID:      InvalidStreamID,
 		lastStreamID:     InvalidStreamID,
+		qlogger:          qlogger,
 	}
 	if idleTimeout > 0 {
 		c.idleTimer = time.AfterFunc(idleTimeout, c.onIdleTimer)
@@ -127,7 +144,7 @@ func (c *Conn) clearStream(id quic.StreamID) {
 	}
 	// The server is performing a graceful shutdown.
 	// If no more streams are remaining, close the connection.
-	if c.maxStreamID != InvalidStreamID {
+	if c.maxStreamID != invalidStreamID {
 		if len(c.streams) == 0 {
 			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeNoError), "")
 		}
@@ -139,12 +156,12 @@ func (c *Conn) openRequestStream(
 	requestWriter *requestWriter,
 	reqDone chan<- struct{},
 	disableCompression bool,
-	maxHeaderBytes uint64,
+	maxHeaderBytes int,
 ) (*RequestStream, error) {
 	c.streamMx.Lock()
 	maxStreamID := c.maxStreamID
 	var nextStreamID quic.StreamID
-	if c.lastStreamID == InvalidStreamID {
+	if c.lastStreamID == invalidStreamID {
 		nextStreamID = 0
 	} else {
 		nextStreamID = c.lastStreamID + 4
@@ -152,7 +169,7 @@ func (c *Conn) openRequestStream(
 	c.streamMx.Unlock()
 	// Streams with stream ID equal to or greater than the stream ID carried in the GOAWAY frame
 	// will be rejected, see section 5.2 of RFC 9114.
-	if maxStreamID != InvalidStreamID && nextStreamID >= maxStreamID {
+	if maxStreamID != invalidStreamID && nextStreamID >= maxStreamID {
 		return nil, errGoAway
 	}
 
@@ -170,14 +187,14 @@ func (c *Conn) openRequestStream(
 	return newRequestStream(
 		ctx,
 		c.Options,
-		newStream(hstr, c, trace, func(r io.Reader, l uint64) error {
-			hdr, err := c.decodeTrailers(r, l, maxHeaderBytes)
+		newStream(hstr, c, trace, func(r io.Reader, hf *headersFrame) error {
+			hdr, err := c.decodeTrailers(r, str.StreamID(), hf, maxHeaderBytes)
 			if err != nil {
 				return err
 			}
 			rsp.Trailer = hdr
 			return nil
-		}),
+		}, c.qlogger),
 		requestWriter,
 		reqDone,
 		c.decoder,
@@ -187,20 +204,32 @@ func (c *Conn) openRequestStream(
 	), nil
 }
 
-func (c *Conn) decodeTrailers(r io.Reader, l, maxHeaderBytes uint64) (http.Header, error) {
-	if l > maxHeaderBytes {
-		return nil, fmt.Errorf("HEADERS frame too large: %d bytes (max: %d)", l, maxHeaderBytes)
+func (c *Conn) decodeTrailers(r io.Reader, streamID quic.StreamID, hf *headersFrame, maxHeaderBytes int) (http.Header, error) {
+	if hf.Length > uint64(maxHeaderBytes) {
+		maybeQlogInvalidHeadersFrame(c.qlogger, streamID, hf.Length)
+		return nil, fmt.Errorf("http3: HEADERS frame too large: %d bytes (max: %d)", hf.Length, maxHeaderBytes)
 	}
 
-	b := make([]byte, l)
+	b := make([]byte, hf.Length)
 	if _, err := io.ReadFull(r, b); err != nil {
 		return nil, err
 	}
-	fields, err := c.decoder.DecodeFull(b)
+	decodeFn := c.decoder.Decode(b)
+	var fields []qpack.HeaderField
+	var headerFields *[]qpack.HeaderField
+	if c.qlogger != nil {
+		fields = make([]qpack.HeaderField, 0, 16)
+		headerFields = &fields
+	}
+	trailers, err := parseTrailers(decodeFn, maxHeaderBytes, headerFields)
 	if err != nil {
+		maybeQlogInvalidHeadersFrame(c.qlogger, streamID, hf.Length)
 		return nil, err
 	}
-	return parseTrailers(fields)
+	if c.qlogger != nil {
+		qlogParsedHeadersFrame(c.qlogger, streamID, hf, fields)
+	}
+	return trailers, nil
 }
 
 func (c *Conn) CloseWithError(code quic.ApplicationErrorCode, msg string) error {
@@ -210,86 +239,53 @@ func (c *Conn) CloseWithError(code quic.ApplicationErrorCode, msg string) error 
 	return c.conn.CloseWithError(code, msg)
 }
 
-func (c *Conn) handleUnidirectionalStreams(hijack func(StreamType, quic.ConnectionTracingID, *quic.ReceiveStream, error) (hijacked bool)) {
-	var (
-		rcvdControlStr      atomic.Bool
-		rcvdQPACKEncoderStr atomic.Bool
-		rcvdQPACKDecoderStr atomic.Bool
-	)
-
-	for {
-		str, err := c.conn.AcceptUniStream(context.Background())
-		if err != nil {
-			if c.logger != nil {
-				c.logger.Debug("accepting unidirectional stream failed", "error", err)
-			}
-			return
+func (c *Conn) handleUnidirectionalStream(str *quic.ReceiveStream) {
+	streamType, err := quicvarint.Read(quicvarint.NewReader(str))
+	if err != nil {
+		if c.logger != nil {
+			c.logger.Debug("reading stream type on stream failed", "stream ID", str.StreamID(), "error", err)
 		}
-
-		go func(str *quic.ReceiveStream) {
-			streamType, err := quicvarint.Read(quicvarint.NewReader(str))
-			if err != nil {
-				id := c.Context().Value(quic.ConnectionTracingKey).(quic.ConnectionTracingID)
-				if hijack != nil && hijack(StreamType(streamType), id, str, err) {
-					return
-				}
-				if c.logger != nil {
-					c.logger.Debug("reading stream type on stream failed", "stream ID", str.StreamID(), "error", err)
-				}
-				return
-			}
-			// We're only interested in the control stream here.
-			switch streamType {
-			case streamTypeControlStream:
-			case streamTypeQPACKEncoderStream:
-				if isFirst := rcvdQPACKEncoderStr.CompareAndSwap(false, true); !isFirst {
-					c.CloseWithError(quic.ApplicationErrorCode(ErrCodeStreamCreationError), "duplicate QPACK encoder stream")
-				}
-				// Our QPACK implementation doesn't use the dynamic table yet.
-				return
-			case streamTypeQPACKDecoderStream:
-				if isFirst := rcvdQPACKDecoderStr.CompareAndSwap(false, true); !isFirst {
-					c.CloseWithError(quic.ApplicationErrorCode(ErrCodeStreamCreationError), "duplicate QPACK decoder stream")
-				}
-				// Our QPACK implementation doesn't use the dynamic table yet.
-				return
-			case streamTypePushStream:
-				switch c.perspective {
-				case PerspectiveClient:
-					// we never increased the Push ID, so we don't expect any push streams
-					c.CloseWithError(quic.ApplicationErrorCode(ErrCodeIDError), "")
-				case PerspectiveServer:
-					// only the server can push
-					c.CloseWithError(quic.ApplicationErrorCode(ErrCodeStreamCreationError), "")
-				}
-				return
-			default:
-				if hijack != nil {
-					if hijack(
-						StreamType(streamType),
-						c.Context().Value(quic.ConnectionTracingKey).(quic.ConnectionTracingID),
-						str,
-						nil,
-					) {
-						return
-					}
-				}
-				str.CancelRead(quic.StreamErrorCode(ErrCodeStreamCreationError))
-				return
-			}
-			// Only a single control stream is allowed.
-			if isFirstControlStr := rcvdControlStr.CompareAndSwap(false, true); !isFirstControlStr {
-				c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeStreamCreationError), "duplicate control stream")
-				return
-			}
-			c.handleControlStream(str)
-		}(str)
+		return
 	}
+	// We're only interested in the control stream here.
+	switch streamType {
+	case streamTypeControlStream:
+	case streamTypeQPACKEncoderStream:
+		if isFirst := c.rcvdQPACKEncoderStr.CompareAndSwap(false, true); !isFirst {
+			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeStreamCreationError), "duplicate QPACK encoder stream")
+		}
+		// Our QPACK implementation doesn't use the dynamic table yet.
+		return
+	case streamTypeQPACKDecoderStream:
+		if isFirst := c.rcvdQPACKDecoderStr.CompareAndSwap(false, true); !isFirst {
+			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeStreamCreationError), "duplicate QPACK decoder stream")
+		}
+		// Our QPACK implementation doesn't use the dynamic table yet.
+		return
+	case streamTypePushStream:
+		if c.isServer {
+			// only the server can push
+			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeStreamCreationError), "")
+		} else {
+			// we never increased the Push ID, so we don't expect any push streams
+			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeIDError), "")
+		}
+		return
+	default:
+		str.CancelRead(quic.StreamErrorCode(ErrCodeStreamCreationError))
+		return
+	}
+	// Only a single control stream is allowed.
+	if isFirstControlStr := c.rcvdControlStr.CompareAndSwap(false, true); !isFirstControlStr {
+		c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeStreamCreationError), "duplicate control stream")
+		return
+	}
+	c.handleControlStream(str)
 }
 
 func (c *Conn) handleControlStream(str *quic.ReceiveStream) {
-	fp := &frameParser{closeConn: c.conn.CloseWithError, r: str}
-	f, err := fp.ParseNext()
+	fp := &frameParser{closeConn: c.conn.CloseWithError, r: str, streamID: str.StreamID()}
+	f, err := fp.ParseNext(c.qlogger)
 	if err != nil {
 		var serr *quic.StreamError
 		if err == io.EOF || errors.As(err, &serr) {
@@ -314,7 +310,7 @@ func (c *Conn) handleControlStream(str *quic.ReceiveStream) {
 		// If datagram support was enabled on our side as well as on the server side,
 		// we can expect it to have been negotiated both on the transport and on the HTTP/3 layer.
 		// Note: ConnectionState() will block until the handshake is complete (relevant when using 0-RTT).
-		if c.enableDatagrams && !c.ConnectionState().SupportsDatagrams {
+		if c.enableDatagrams && !c.ConnectionState().SupportsDatagrams.Remote {
 			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeSettingsError), "missing QUIC Datagram support")
 			return
 		}
@@ -328,12 +324,12 @@ func (c *Conn) handleControlStream(str *quic.ReceiveStream) {
 	}
 
 	// we don't support server push, hence we don't expect any GOAWAY frames from the client
-	if c.perspective == PerspectiveServer {
+	if c.isServer {
 		return
 	}
 
 	for {
-		f, err := fp.ParseNext()
+		f, err := fp.ParseNext(c.qlogger)
 		if err != nil {
 			var serr *quic.StreamError
 			if err == io.EOF || errors.As(err, &serr) {
@@ -356,7 +352,7 @@ func (c *Conn) handleControlStream(str *quic.ReceiveStream) {
 			return
 		}
 		c.streamMx.Lock()
-		if c.maxStreamID != InvalidStreamID && goaway.StreamID > c.maxStreamID {
+		if c.maxStreamID != invalidStreamID && goaway.StreamID > c.maxStreamID {
 			c.streamMx.Unlock()
 			c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeIDError), "")
 			return
@@ -376,8 +372,18 @@ func (c *Conn) handleControlStream(str *quic.ReceiveStream) {
 func (c *Conn) sendDatagram(streamID quic.StreamID, b []byte) error {
 	// TODO: this creates a lot of garbage and an additional copy
 	data := make([]byte, 0, len(b)+8)
+	quarterStreamID := uint64(streamID / 4)
 	data = quicvarint.Append(data, uint64(streamID/4))
 	data = append(data, b...)
+	if c.qlogger != nil {
+		c.qlogger.RecordEvent(qlog.DatagramCreated{
+			QuarterStreamID: quarterStreamID,
+			Raw: qlog.RawInfo{
+				Length:        len(data),
+				PayloadLength: len(b),
+			},
+		})
+	}
 	return c.conn.SendDatagram(data)
 }
 
@@ -391,6 +397,15 @@ func (c *Conn) receiveDatagrams() error {
 		if err != nil {
 			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeDatagramError), "")
 			return fmt.Errorf("could not read quarter stream id: %w", err)
+		}
+		if c.qlogger != nil {
+		c.qlogger.RecordEvent(qlog.DatagramParsed{
+			QuarterStreamID: quarterStreamID,
+				Raw: qlog.RawInfo{
+					Length:        len(b),
+					PayloadLength: len(b) - n,
+				},
+			})
 		}
 		if quarterStreamID > maxQuarterStreamID {
 			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeDatagramError), "")

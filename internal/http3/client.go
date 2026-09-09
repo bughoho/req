@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptrace"
 	"net/textproto"
@@ -14,6 +15,7 @@ import (
 	"github.com/imroc/req/v3/internal/dump"
 	"github.com/imroc/req/v3/internal/transport"
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3/qlog"
 	"github.com/quic-go/quic-go/quicvarint"
 
 	"github.com/quic-go/qpack"
@@ -60,7 +62,7 @@ type ClientConn struct {
 
 	// maxResponseHeaderBytes specifies a limit on how many response bytes are
 	// allowed in the server's response header.
-	maxResponseHeaderBytes uint64
+	maxResponseHeaderBytes int
 
 	// disableCompression, if true, prevents the Transport from requesting compression with an
 	// "Accept-Encoding: gzip" request header when the Request contains no existing Accept-Encoding value.
@@ -82,9 +84,7 @@ func newClientConn(
 	conn *quic.Conn,
 	enableDatagrams bool,
 	additionalSettings map[uint64]uint64,
-	streamHijacker func(FrameType, quic.ConnectionTracingID, *quic.Stream, error) (hijacked bool, err error),
-	uniStreamHijacker func(StreamType, quic.ConnectionTracingID, *quic.ReceiveStream, error) (hijacked bool),
-	maxResponseHeaderBytes int64,
+	maxResponseHeaderBytes int,
 	disableCompression bool,
 	logger *slog.Logger,
 ) *ClientConn {
@@ -98,15 +98,15 @@ func newClientConn(
 	if maxResponseHeaderBytes <= 0 {
 		c.maxResponseHeaderBytes = defaultMaxResponseHeaderBytes
 	} else {
-		c.maxResponseHeaderBytes = uint64(maxResponseHeaderBytes)
+		c.maxResponseHeaderBytes = maxResponseHeaderBytes
 	}
-	c.decoder = qpack.NewDecoder(func(hf qpack.HeaderField) {})
+	c.decoder = qpack.NewDecoder()
 	c.requestWriter = newRequestWriter()
 	c.conn = newConnection(
 		conn.Context(),
 		conn,
 		c.enableDatagrams,
-		PerspectiveClient,
+		false, // client
 		c.logger,
 		0,
 		opts,
@@ -120,11 +120,12 @@ func newClientConn(
 			c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeInternalError), "")
 		}
 	}()
-	if streamHijacker != nil {
-		go c.handleBidirectionalStreams(streamHijacker)
-	}
-	go c.conn.handleUnidirectionalStreams(uniStreamHijacker)
 	return c
+}
+
+// handleUnidirectionalStream handles an incoming unidirectional stream.
+func (c *ClientConn) handleUnidirectionalStream(str *quic.ReceiveStream) {
+	c.conn.handleUnidirectionalStream(str)
 }
 
 // OpenRequestStream opens a new request stream on the HTTP/3 connection.
@@ -141,40 +142,37 @@ func (c *ClientConn) setupConn() error {
 	b := make([]byte, 0, 64)
 	b = quicvarint.Append(b, streamTypeControlStream)
 	// send the SETTINGS frame
-	b = (&settingsFrame{Datagram: c.enableDatagrams, Other: c.additionalSettings}).Append(b)
+	b = (&settingsFrame{
+		Datagram:            c.enableDatagrams,
+		Other:               c.additionalSettings,
+		MaxFieldSectionSize: int64(c.maxResponseHeaderBytes),
+	}).Append(b)
+	if c.conn.qlogger != nil {
+		sf := qlog.SettingsFrame{
+			MaxFieldSectionSize: int64(c.maxResponseHeaderBytes),
+			Other:               maps.Clone(c.additionalSettings),
+		}
+		if c.enableDatagrams {
+			sf.Datagram = pointer(true)
+		}
+		c.conn.qlogger.RecordEvent(qlog.FrameCreated{
+			StreamID: str.StreamID(),
+			Raw:      qlog.RawInfo{Length: len(b)},
+			Frame:    qlog.Frame{Frame: sf},
+		})
+	}
 	_, err = str.Write(b)
 	return err
 }
 
-func (c *ClientConn) handleBidirectionalStreams(streamHijacker func(FrameType, quic.ConnectionTracingID, *quic.Stream, error) (hijacked bool, err error)) {
-	for {
-		str, err := c.conn.conn.AcceptStream(context.Background())
-		if err != nil {
-			if c.logger != nil {
-				c.logger.Debug("accepting bidirectional stream failed", "error", err)
-			}
-			return
-		}
-		fp := &frameParser{
-			r:         str,
-			closeConn: c.conn.CloseWithError,
-			unknownFrameHandler: func(ft FrameType, e error) (processed bool, err error) {
-				id := c.conn.Context().Value(quic.ConnectionTracingKey).(quic.ConnectionTracingID)
-				return streamHijacker(ft, id, str, e)
-			},
-		}
-		go func() {
-			if _, err := fp.ParseNext(); err == errHijacked {
-				return
-			}
-			if err != nil {
-				if c.logger != nil {
-					c.logger.Debug("error handling stream", "error", err)
-				}
-			}
-			c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeFrameUnexpected), "received HTTP/3 frame on bidirectional stream")
-		}()
-	}
+// HandleBidirectionalStream handles an incoming bidirectional stream.
+// According to RFC 9114, the server is not allowed to open bidirectional streams,
+// so this method closes the connection with an error.
+func (c *ClientConn) HandleBidirectionalStream(str *quic.Stream) {
+	c.conn.CloseWithError(
+		quic.ApplicationErrorCode(ErrCodeStreamCreationError),
+		fmt.Sprintf("server opened bidirectional stream %d", str.StreamID()),
+	)
 }
 
 // RoundTrip executes a request and returns a response
@@ -341,32 +339,38 @@ func (c *ClientConn) sendRequestBody(str *RequestStream, body io.ReadCloser, con
 
 func (c *ClientConn) doRequest(req *http.Request, str *RequestStream) (*http.Response, error) {
 	trace := httptrace.ContextClientTrace(req.Context())
+	var sendingReqFailed bool
 	if err := str.sendRequestHeader(req); err != nil {
 		traceWroteRequest(trace, err)
-		return nil, err
+		if c.logger != nil {
+			c.logger.Debug("error writing request", "error", err)
+		}
+		sendingReqFailed = true
 	}
-	if req.Body == nil {
-		traceWroteRequest(trace, nil)
-		str.Close()
-	} else {
-		// send the request body asynchronously
-		go func() {
-			contentLength := int64(-1)
-			// According to the documentation for http.Request.ContentLength,
-			// a value of 0 with a non-nil Body is also treated as unknown content length.
-			if req.ContentLength > 0 {
-				contentLength = req.ContentLength
-			}
-			dumps := dump.GetDumpers(req.Context(), c.Dump)
-			err := c.sendRequestBody(str, req.Body, contentLength, dumps)
-			traceWroteRequest(trace, err)
-			if err != nil {
-				if c.Debugf != nil {
-					c.Debugf("error writing request: %s", err.Error())
-				}
-			}
+	if !sendingReqFailed {
+		if req.Body == nil {
+			traceWroteRequest(trace, nil)
 			str.Close()
-		}()
+		} else {
+			// send the request body asynchronously
+			go func() {
+				contentLength := int64(-1)
+				// According to the documentation for http.Request.ContentLength,
+				// a value of 0 with a non-nil Body is also treated as unknown content length.
+				if req.ContentLength > 0 {
+					contentLength = req.ContentLength
+				}
+			  dumps := dump.GetDumpers(req.Context(), c.Dump)
+				err := c.sendRequestBody(str, req.Body, contentLength, dumps)
+				traceWroteRequest(trace, err)
+				if err != nil {
+					if c.logger != nil {
+						c.logger.Debug("error writing request", "error", err)
+					}
+				}
+				str.Close()
+			}()
+		}
 	}
 
 	// copy from net/http: support 1xx responses
@@ -408,4 +412,18 @@ func (c *ClientConn) doRequest(req *http.Request, str *RequestStream) (*http.Res
 // open streams on the HTTP/3 connection (e.g. WebTransport).
 func (c *ClientConn) Conn() *Conn {
 	return c.conn
+}
+
+// RawClientConn is a low-level HTTP/3 client connection.
+// It allows the application to take control of the stream accept loops,
+// giving the application the ability to handle streams originating from the server.
+// This is useful for implementing WebTransport or other advanced protocols.
+type RawClientConn struct {
+	*ClientConn
+}
+
+// HandleUnidirectionalStream handles an incoming unidirectional stream.
+// This should be called for each unidirectional stream accepted from the QUIC connection.
+func (c *RawClientConn) HandleUnidirectionalStream(str *quic.ReceiveStream) {
+	c.handleUnidirectionalStream(str)
 }
