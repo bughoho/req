@@ -76,9 +76,15 @@ type Options struct {
 	// (context.WithoutCancel in Transport.getConn), so it carries no
 	// deadline: the request's own timeout does NOT bound this handshake.
 	// Without this, a proxy that accepts TCP but never replies wedges the
-	// dial goroutine forever. Mirrors the fixed guard the HTTPS CONNECT
-	// proxy path already has. Non-positive means no timeout.
+	// dial goroutine forever. Mirrors the guard HTTPProxyConnectTimeout
+	// provides for the HTTPS CONNECT proxy path. Non-positive means no timeout.
 	SocksDialTimeout time.Duration
+
+	// HTTPProxyConnectTimeout, if positive, bounds the HTTPS-over-proxy CONNECT
+	// handshake (write CONNECT request + read response) performed on the detached
+	// dial context — the same class of guard SocksDialTimeout provides for SOCKS5.
+	// Non-positive means the built-in 1-minute default.
+	HTTPProxyConnectTimeout time.Duration
 
 	// DisableKeepAlives, if true, disables HTTP keep-alives and
 	// will only use the connection to the server for a single

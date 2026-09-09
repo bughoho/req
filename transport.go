@@ -171,13 +171,14 @@ func NewTransport() *Transport {
 func T() *Transport {
 	t := &Transport{
 		Options: transport.Options{
-			Proxy:                 http.ProxyFromEnvironment,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			SocksDialTimeout:      30 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-			TLSClientConfig:       &tls.Config{NextProtos: []string{"http/1.1", "h2"}},
+			Proxy:                   http.ProxyFromEnvironment,
+			MaxIdleConns:            100,
+			IdleConnTimeout:         90 * time.Second,
+			TLSHandshakeTimeout:     10 * time.Second,
+			SocksDialTimeout:        30 * time.Second,
+			HTTPProxyConnectTimeout: 1 * time.Minute,
+			ExpectContinueTimeout:   1 * time.Second,
+			TLSClientConfig:         &tls.Config{NextProtos: []string{"http/1.1", "h2"}},
 		},
 	}
 	t.t2 = &h2internal.Transport{Options: &t.Options}
@@ -319,6 +320,15 @@ func (t *Transport) SetTLSHandshakeTimeout(timeout time.Duration) *Transport {
 // request context does not bound this handshake.
 func (t *Transport) SetSocksDialTimeout(timeout time.Duration) *Transport {
 	t.SocksDialTimeout = timeout
+	return t
+}
+
+// SetHTTPProxyConnectTimeout sets the HTTPProxyConnectTimeout, which bounds
+// the HTTPS-over-proxy CONNECT handshake. Non-positive means the built-in
+// 1-minute default. See Options.HTTPProxyConnectTimeout for why the request
+// context does not bound this handshake.
+func (t *Transport) SetHTTPProxyConnectTimeout(timeout time.Duration) *Transport {
+	t.HTTPProxyConnectTimeout = timeout
 	return t
 }
 
@@ -2243,7 +2253,11 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *pers
 		// Set a (long) timeout here to make sure we don't block forever
 		// and leak a goroutine if the connection stops replying after
 		// the TCP connect.
-		connectCtx, cancel := testHookProxyConnectTimeout(ctx, 1*time.Minute)
+		connectTimeout := t.HTTPProxyConnectTimeout
+		if connectTimeout <= 0 {
+			connectTimeout = 1 * time.Minute
+		}
+		connectCtx, cancel := testHookProxyConnectTimeout(ctx, connectTimeout)
 		defer cancel()
 
 		didReadResponse := make(chan struct{}) // closed after CONNECT write+read is done or fails
