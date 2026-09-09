@@ -2191,7 +2191,18 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *pers
 			}
 			d.Authenticate = auth.Authenticate
 		}
-		if _, err := d.DialWithConn(ctx, conn, "tcp", cm.targetAddr); err != nil {
+		// The dial context is detached from the request (context.WithoutCancel
+		// in getConn), so it carries no deadline: a proxy that accepts the TCP
+		// connection but never completes the SOCKS handshake would wedge this
+		// goroutine forever. Bound the handshake explicitly, mirroring the
+		// HTTPS CONNECT path's guard below.
+		socksCtx := ctx
+		if t.SocksDialTimeout > 0 {
+			var cancel context.CancelFunc
+			socksCtx, cancel = context.WithTimeout(ctx, t.SocksDialTimeout)
+			defer cancel()
+		}
+		if _, err := d.DialWithConn(socksCtx, conn, "tcp", cm.targetAddr); err != nil {
 			conn.Close()
 			return nil, err
 		}
