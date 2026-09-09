@@ -175,6 +175,7 @@ func T() *Transport {
 			MaxIdleConns:          100,
 			IdleConnTimeout:       90 * time.Second,
 			TLSHandshakeTimeout:   10 * time.Second,
+			SocksDialTimeout:      30 * time.Second,
 			ExpectContinueTimeout: 1 * time.Second,
 			TLSClientConfig:       &tls.Config{NextProtos: []string{"http/1.1", "h2"}},
 		},
@@ -309,6 +310,15 @@ func (t *Transport) SetIdleConnTimeout(timeout time.Duration) *Transport {
 // Zero means no timeout.
 func (t *Transport) SetTLSHandshakeTimeout(timeout time.Duration) *Transport {
 	t.TLSHandshakeTimeout = timeout
+	return t
+}
+
+// SetSocksDialTimeout sets the SocksDialTimeout, which bounds the SOCKS5
+// handshake after the TCP connection to the proxy is established. Zero
+// means no timeout. See Options.SocksDialTimeout for why the request
+// context does not bound this handshake.
+func (t *Transport) SetSocksDialTimeout(timeout time.Duration) *Transport {
+	t.SocksDialTimeout = timeout
 	return t
 }
 
