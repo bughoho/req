@@ -1359,6 +1359,20 @@ func (c *Client) SetTLSHandshakeTimeout(timeout time.Duration) *Client {
 	return c
 }
 
+// SetSocksDialTimeout sets the SOCKS5 handshake timeout. See
+// Transport.SetSocksDialTimeout.
+func (c *Client) SetSocksDialTimeout(timeout time.Duration) *Client {
+	c.Transport.SetSocksDialTimeout(timeout)
+	return c
+}
+
+// SetHTTPProxyConnectTimeout sets the HTTPS-over-proxy CONNECT handshake
+// timeout. See Transport.SetHTTPProxyConnectTimeout.
+func (c *Client) SetHTTPProxyConnectTimeout(timeout time.Duration) *Client {
+	c.Transport.SetHTTPProxyConnectTimeout(timeout)
+	return c
+}
+
 // EnableForceHTTP1 enable force using HTTP1 (disabled by default).
 //
 // Attention: This method should not be called when ImpersonateXXX, SetTLSFingerPrint or
