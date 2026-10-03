@@ -109,10 +109,11 @@ type Transport struct {
 	// waiting for their turn.
 	StrictMaxConcurrentStreams bool
 
-	// IdleConnTimeout is the maximum amount of time an idle
-	// (keep-alive) connection will remain idle before closing
-	// itself.
-	// Zero means no limit.
+	// IdleConnTimeout is unused: it shadows the embedded
+	// Options.IdleConnTimeout, which is the field that is actually written by
+	// req.Transport and read when arming the per-connection idle timer (see
+	// idleConnTimeout). Kept only to avoid a struct-layout change; set
+	// Options.IdleConnTimeout instead.
 	IdleConnTimeout time.Duration
 
 	// ReadIdleTimeout is the timeout after which a health check using ping
@@ -187,6 +188,19 @@ func (t *Transport) pingTimeout() time.Duration {
 		return 15 * time.Second
 	}
 	return t.PingTimeout
+}
+
+// idleConnTimeout returns the idle timeout from the shared transport.Options.
+// It must be read from Options (not from the depth-0 Transport.IdleConnTimeout
+// field, which shadows it): req.Transport shares its Options by pointer and
+// sets IdleConnTimeout after the h2 Transport is constructed, so the value is
+// only visible here when read at dial time. A Transport built without Options
+// (e.g. a bare Transport{}) has no idle timeout.
+func (t *Transport) idleConnTimeout() time.Duration {
+	if t.Options == nil {
+		return 0
+	}
+	return t.Options.IdleConnTimeout
 }
 
 func (t *Transport) connPool() ClientConnPool {
@@ -891,7 +905,7 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool) (*ClientConn, erro
 	}
 
 	// Start the idle timer after the connection is fully initialized.
-	if d := t.IdleConnTimeout; d != 0 {
+	if d := t.idleConnTimeout(); d != 0 {
 		cc.idleTimeout = d
 		cc.idleTimer = t.afterFunc(d, cc.onIdleTimeout)
 	}
